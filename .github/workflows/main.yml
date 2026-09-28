@@ -1,0 +1,247 @@
+name: Secure RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+
+      # =========================================================
+      # 1. Enable Remote Desktop
+      # =========================================================
+      - name: Configure Core RDP Settings
+        shell: powershell
+        run: |
+          Write-Host "Enabling Remote Desktop..."
+
+          # Enable RDP
+          Set-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" `
+            -Value 0
+
+          # Enable Network Level Authentication
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name "UserAuthentication" `
+            -Value 1
+
+          # Enable Windows Firewall rules
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+          # Start RDP service
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+
+          Write-Host "RDP enabled successfully."
+
+
+      # =========================================================
+      # 2. Create temporary RDP account
+      # =========================================================
+      - name: Create RDP User with Secure Password
+        shell: powershell
+        run: |
+          $username = "RDP"
+
+          # Generate temporary strong password
+          $random = [Guid]::NewGuid().ToString("N").Substring(0,16)
+          $password = "GitHub!${random}9a"
+
+          $securePassword = ConvertTo-SecureString `
+            $password `
+            -AsPlainText `
+            -Force
+
+          # Remove existing user if present
+          $existingUser = Get-LocalUser `
+            -Name $username `
+            -ErrorAction SilentlyContinue
+
+          if ($existingUser) {
+
+              Write-Host "RDP user already exists. Updating password."
+
+              Set-LocalUser `
+                -Name $username `
+                -Password $securePassword
+
+          } else {
+
+              Write-Host "Creating RDP user..."
+
+              New-LocalUser `
+                -Name $username `
+                -Password $securePassword `
+                -AccountNeverExpires `
+                -PasswordNeverExpires `
+                -Description "Temporary RDP Account"
+          }
+
+          # Add user to Remote Desktop Users
+          try {
+
+              Add-LocalGroupMember `
+                -Group "Remote Desktop Users" `
+                -Member $username `
+                -ErrorAction Stop
+
+          } catch {
+
+              Write-Host "User already exists in Remote Desktop Users group."
+          }
+
+          # Add user to Administrators
+          try {
+
+              Add-LocalGroupMember `
+                -Group "Administrators" `
+                -Member $username `
+                -ErrorAction Stop
+
+          } catch {
+
+              Write-Host "User already exists in Administrators group."
+          }
+
+          # Save credentials for later steps
+          "RDP_USERNAME=$username" | Out-File `
+            -FilePath $env:GITHUB_ENV `
+            -Append
+
+          "RDP_PASSWORD=$password" | Out-File `
+            -FilePath $env:GITHUB_ENV `
+            -Append
+
+          Write-Host "RDP user created successfully."
+
+
+      # =========================================================
+      # 3. Connect GitHub Runner to Tailscale
+      # =========================================================
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAISCALE_AUTH_KEY }}
+          version: latest
+          use-cache: true
+          timeout: 2m
+          retry: 5
+          log-mode: grouped
+
+
+      # =========================================================
+      # 4. Show Tailscale Status
+      # =========================================================
+      - name: Show Tailscale Status
+        shell: powershell
+        run: |
+          Write-Host "Tailscale Status:"
+          tailscale status
+
+          Write-Host ""
+          Write-Host "Tailscale IP:"
+          tailscale ip -4
+
+
+      # =========================================================
+      # 5. Test Tailscale
+      # =========================================================
+      - name: Test Tailscale Connection
+        shell: powershell
+        run: |
+          $tailscaleIP = (
+              tailscale ip -4 |
+              Select-Object -First 1
+          ).Trim()
+
+          if ([string]::IsNullOrWhiteSpace($tailscaleIP)) {
+              throw "Tailscale IPv4 address not found."
+          }
+
+          Write-Host "Tailscale connected successfully."
+          Write-Host "Tailscale IP: $tailscaleIP"
+
+          "TAILSCALE_IP=$tailscaleIP" | Out-File `
+            -FilePath $env:GITHUB_ENV `
+            -Append
+
+
+      # =========================================================
+      # 6. Test RDP Port
+      # =========================================================
+      - name: Verify RDP Accessibility
+        shell: powershell
+        run: |
+          Write-Host "Testing RDP port 3389..."
+
+          $test = Test-NetConnection `
+            -ComputerName 127.0.0.1 `
+            -Port 3389 `
+            -WarningAction SilentlyContinue
+
+          if (-not $test.TcpTestSucceeded) {
+              throw "RDP port 3389 is not listening."
+          }
+
+          Write-Host "TCP connectivity successful."
+
+
+      # =========================================================
+      # 7. Show Connection Information
+      # =========================================================
+      - name: RDP Connection Details
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "==========================================="
+          Write-Host "        RDP CONNECTION READY"
+          Write-Host "==========================================="
+          Write-Host "Address : $env:TAILSCALE_IP"
+          Write-Host "Port    : 3389"
+          Write-Host "Username: $env:RDP_USERNAME"
+          Write-Host "==========================================="
+
+          # Add connection details to GitHub Job Summary
+          @"
+          # RDP Connection Ready
+
+          **Computer:** $env:TAILSCALE_IP
+
+          **Port:** 3389
+
+          **Username:** $env:RDP_USERNAME
+
+          **Password:** $env:RDP_PASSWORD
+
+          Connect using Microsoft Remote Desktop from a device
+          connected to the same Tailscale network.
+          "@ | Out-File `
+            -FilePath $env:GITHUB_STEP_SUMMARY `
+            -Append
+
+
+      # =========================================================
+      # 8. Keep Runner Alive
+      # =========================================================
+      - name: Maintain Connection
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "RDP session is active."
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host ""
+          Write-Host "Cancel the workflow when finished."
+
+          while ($true) {
+
+              $time = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+              Write-Host "[$time] RDP connection active..."
+
+              Start-Sleep -Seconds 300
+          }
