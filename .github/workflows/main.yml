@@ -1,0 +1,351 @@
+name: Manual Tailscale RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+
+      # ============================================================
+      # 1. INSTALL TAILSCALE
+      # ============================================================
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Downloading Tailscale..."
+
+          $installer = "$env:TEMP\tailscale-setup.exe"
+
+          Invoke-WebRequest `
+            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" `
+            -OutFile $installer
+
+          Write-Host "Installing Tailscale..."
+
+          Start-Process `
+            -FilePath $installer `
+            -ArgumentList "/S" `
+            -Wait
+
+          Start-Sleep -Seconds 5
+
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $tailscale)) {
+              throw "Tailscale installation failed."
+          }
+
+          "TAILSCALE_EXE=$tailscale" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
+
+          Write-Host "Tailscale installed successfully."
+
+          & $tailscale version
+
+
+      # ============================================================
+      # 2. MANUAL TAILSCALE AUTHORIZATION
+      #
+      # IMPORTANT:
+      # OPEN THIS STEP IN ACTIONS LOGS.
+      #
+      # IT WILL SHOW:
+      #
+      # To authenticate, visit:
+      # https://login.tailscale.com/a/XXXXXXXX
+      #
+      # Open that URL and authorize.
+      # Workflow will continue automatically.
+      # ============================================================
+      - name: AUTHORIZE TAILSCALE - OPEN THIS STEP
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host "TAILSCALE AUTHORIZATION REQUIRED"
+          Write-Host "=============================================="
+          Write-Host ""
+          Write-Host "A Tailscale authorization URL will appear below."
+          Write-Host ""
+          Write-Host "1. Open the URL"
+          Write-Host "2. Login to your Tailscale account"
+          Write-Host "3. Authorize this machine"
+          Write-Host "4. Come back to GitHub Actions"
+          Write-Host ""
+          Write-Host "Waiting for authorization..."
+          Write-Host "=============================================="
+          Write-Host ""
+
+          & "$env:TAILSCALE_EXE" up `
+            --force-reauth `
+            --unattended=true `
+            --timeout=20m
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Tailscale authorization failed or timed out."
+          }
+
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host "TAILSCALE AUTHORIZATION SUCCESSFUL"
+          Write-Host "=============================================="
+
+
+      # ============================================================
+      # 3. CHECK TAILSCALE + SAVE IP
+      # ============================================================
+      - name: Get Tailscale IP
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Checking Tailscale connection..."
+
+          & "$env:TAILSCALE_EXE" status
+
+          $tailscaleIP = (
+              & "$env:TAILSCALE_EXE" ip -4 |
+              Select-Object -First 1
+          ).Trim()
+
+          if ([string]::IsNullOrWhiteSpace($tailscaleIP)) {
+              throw "Tailscale IPv4 address was not found."
+          }
+
+          Write-Host ""
+          Write-Host "Tailscale connected."
+          Write-Host "Tailscale IP: $tailscaleIP"
+
+          "TAILSCALE_IP=$tailscaleIP" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
+
+
+      # ============================================================
+      # 4. ENABLE WINDOWS RDP
+      # ============================================================
+      - name: Configure Remote Desktop
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Enabling Remote Desktop..."
+
+          Set-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" `
+            -Value 0
+
+          # Keep NLA enabled
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name "UserAuthentication" `
+            -Value 1
+
+          Enable-NetFirewallRule `
+            -DisplayGroup "Remote Desktop"
+
+          Set-Service `
+            -Name TermService `
+            -StartupType Automatic
+
+          Start-Service `
+            -Name TermService
+
+          Write-Host "Remote Desktop enabled."
+
+
+      # ============================================================
+      # 5. CREATE RDP USER + GENERATE PASSWORD
+      # ============================================================
+      - name: Create RDP Username and Password
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $username = "RDP"
+
+          # Generate strong temporary password
+          $random = [Guid]::NewGuid().ToString("N").Substring(0,20)
+          $password = "Gh!9$random"
+
+          $securePassword = ConvertTo-SecureString `
+            $password `
+            -AsPlainText `
+            -Force
+
+          $existingUser = Get-LocalUser `
+            -Name $username `
+            -ErrorAction SilentlyContinue
+
+          if ($existingUser) {
+
+              Write-Host "Updating existing RDP user..."
+
+              Set-LocalUser `
+                -Name $username `
+                -Password $securePassword
+
+              Enable-LocalUser `
+                -Name $username
+
+          } else {
+
+              Write-Host "Creating RDP user..."
+
+              New-LocalUser `
+                -Name $username `
+                -Password $securePassword `
+                -AccountNeverExpires `
+                -PasswordNeverExpires `
+                -Description "Temporary GitHub RDP User"
+          }
+
+          # Allow RDP login
+          try {
+
+              Add-LocalGroupMember `
+                -Group "Remote Desktop Users" `
+                -Member $username `
+                -ErrorAction Stop
+
+          } catch {
+
+              Write-Host "User is already in Remote Desktop Users."
+          }
+
+          # Administrator access
+          try {
+
+              Add-LocalGroupMember `
+                -Group "Administrators" `
+                -Member $username `
+                -ErrorAction Stop
+
+          } catch {
+
+              Write-Host "User is already in Administrators."
+          }
+
+          "RDP_USERNAME=$username" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
+
+          "RDP_PASSWORD=$password" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
+
+          Write-Host "RDP account created successfully."
+
+
+      # ============================================================
+      # 6. TEST RDP PORT 3389
+      # ============================================================
+      - name: Verify RDP
+        shell: powershell
+        run: |
+          Write-Host "Testing RDP port 3389..."
+
+          Start-Sleep -Seconds 3
+
+          $result = Test-NetConnection `
+            -ComputerName 127.0.0.1 `
+            -Port 3389 `
+            -WarningAction SilentlyContinue
+
+          if (-not $result.TcpTestSucceeded) {
+              throw "RDP port 3389 is not available."
+          }
+
+          Write-Host "RDP port 3389 is ready."
+
+
+      # ============================================================
+      # 7. SHOW FINAL IP + USERNAME + PASSWORD
+      # ============================================================
+      - name: SHOW RDP IP USERNAME PASSWORD
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host "             RDP IS READY"
+          Write-Host "=============================================="
+          Write-Host ""
+          Write-Host "IP Address : $env:TAILSCALE_IP"
+          Write-Host "Port       : 3389"
+          Write-Host "Username   : $env:RDP_USERNAME"
+          Write-Host "Password   : $env:RDP_PASSWORD"
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host "Connect using Microsoft Remote Desktop."
+          Write-Host "Your computer must also be connected to Tailscale."
+          Write-Host "=============================================="
+
+          @"
+          # RDP Connection Ready
+
+          **IP Address:** $env:TAILSCALE_IP
+
+          **Port:** 3389
+
+          **Username:** $env:RDP_USERNAME
+
+          **Password:** $env:RDP_PASSWORD
+
+          ### Connection
+
+          Open Microsoft Remote Desktop and use:
+
+          Computer: $env:TAILSCALE_IP
+
+          Username: $env:RDP_USERNAME
+
+          Password: $env:RDP_PASSWORD
+          "@ |
+            Out-File `
+              -FilePath $env:GITHUB_STEP_SUMMARY `
+              -Encoding utf8 `
+              -Append
+
+
+      # ============================================================
+      # 8. KEEP RDP RUNNING
+      # ============================================================
+      - name: Keep RDP Session Running
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host "RDP SESSION ACTIVE"
+          Write-Host "=============================================="
+          Write-Host "IP: $env:TAILSCALE_IP"
+          Write-Host ""
+          Write-Host "Do NOT stop this workflow while using RDP."
+          Write-Host "Cancel workflow when finished."
+          Write-Host "=============================================="
+
+          while ($true) {
+
+              $time = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+              Write-Host "[$time] RDP session active at $env:TAILSCALE_IP"
+
+              Start-Sleep -Seconds 300
+          }
