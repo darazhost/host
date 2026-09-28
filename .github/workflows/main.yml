@@ -1,5 +1,3 @@
-- name: Test RDP Connection
-  run: |
     $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
 
     if (-not $testResult.TcpTestSucceeded) {
