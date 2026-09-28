@@ -1,0 +1,38 @@
+- name: Connect to Tailscale
+  uses: tailscale/github-action@v4
+  with:
+    authkey: ${{ secrets.TAISCALE_AUTH_KEY }}
+    version: latest
+    timeout: 2m
+    retry: 5
+    use-cache: true
+    log-mode: grouped
+
+- name: Show Tailscale status
+  shell: powershell
+  run: |
+    tailscale status
+    tailscale ip -4
+
+- name: Test Tailscale connection
+  shell: powershell
+  run: |
+    $ip = (tailscale ip -4).Trim()
+
+    if (-not $ip) {
+      throw "Tailscale IP not found."
+    }
+
+    Write-Host "Tailscale connected successfully."
+    Write-Host "Tailscale IP: $ip"
+
+- name: Test RDP port
+  shell: powershell
+  run: |
+    $result = Test-NetConnection -ComputerName 127.0.0.1 -Port 3389
+
+    if (-not $result.TcpTestSucceeded) {
+      throw "RDP port 3389 is not available."
+    }
+
+    Write-Host "RDP port 3389 is ready."
